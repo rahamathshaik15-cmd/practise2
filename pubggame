@@ -1,0 +1,373 @@
+"""
+pubg_mini.py
+A tiny 2D battle-royale prototype using Pygame.
+
+Controls:
+  - WASD / Arrow keys : move
+  - Mouse move         : aim
+  - Left click         : shoot
+  - R                  : restart
+  - Esc/Close window   : quit
+
+Features:
+  - Player + simple bots (AI that wander & chase if near)
+  - Bullets with simple physics
+  - Shrinking safe zone (you lose health when outside)
+  - HUD: health, players remaining, zone timer
+This is a simplified educational prototype.
+"""
+
+import pygame
+import random
+import math
+import sys
+from dataclasses import dataclass
+
+# --------- Configuration ----------
+WIDTH, HEIGHT = 1024, 640
+FPS = 60
+
+PLAYER_SPEED = 220            # pixels per second
+BOT_SPEED = 140
+BULLET_SPEED = 700
+BULLET_LIFETIME = 1.6        # seconds
+PLAYER_MAX_HEALTH = 100
+BOT_COUNT = 6
+SPAWN_MARGIN = 40
+
+ZONE_START_RADIUS = max(WIDTH, HEIGHT) * 0.6
+ZONE_SHRINK_INTERVAL = 10.0   # seconds between shrinks
+ZONE_SHRINK_AMOUNT = 0.18     # fraction to shrink each interval
+ZONE_DAMAGE_PER_SEC = 18      # damage when outside zone
+
+FONT_NAME = "freesansbold.ttf"
+# ---------------------------------
+
+pygame.init()
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("PUBG-mini (prototype)")
+clock = pygame.time.Clock()
+font = pygame.font.Font(FONT_NAME, 18)
+
+# Utility functions
+def vec_from_angle(angle_radians):
+    return pygame.math.Vector2(math.cos(angle_radians), math.sin(angle_radians))
+
+def clamp(val, a, b):
+    return max(a, min(b, val))
+
+def distance(a, b):
+    return (a - b).length()
+
+# Entities
+@dataclass
+class Bullet:
+    pos: pygame.math.Vector2
+    vel: pygame.math.Vector2
+    owner_id: int
+    lifetime: float = BULLET_LIFETIME
+
+    def update(self, dt):
+        self.pos += self.vel * dt
+        self.lifetime -= dt
+
+    def is_alive(self):
+        return self.lifetime > 0 and 0 <= self.pos.x <= WIDTH and 0 <= self.pos.y <= HEIGHT
+
+class Entity:
+    def __init__(self, pos, radius=14, color=(0, 200, 0), speed=0):
+        self.pos = pygame.math.Vector2(pos)
+        self.vel = pygame.math.Vector2(0, 0)
+        self.radius = radius
+        self.color = color
+        self.speed = speed
+        self.health = PLAYER_MAX_HEALTH
+        self.alive = True
+        self.id = id(self)
+
+    def take_damage(self, d):
+        self.health -= d
+        if self.health <= 0:
+            self.alive = False
+
+    def draw(self, surf, camera_offset=pygame.math.Vector2(0, 0), show_health=True):
+        p = self.pos - camera_offset
+        pygame.draw.circle(surf, self.color, (int(p.x), int(p.y)), self.radius)
+        if show_health:
+            # health bar
+            bar_w = self.radius * 2
+            frac = clamp(self.health / PLAYER_MAX_HEALTH, 0, 1)
+            health_rect = pygame.Rect(p.x - self.radius, p.y - self.radius - 8, bar_w * frac, 5)
+            bg_rect = pygame.Rect(p.x - self.radius, p.y - self.radius - 8, bar_w, 5)
+            pygame.draw.rect(surf, (80, 80, 80), bg_rect)
+            pygame.draw.rect(surf, (50, 200, 50), health_rect)
+
+class Player(Entity):
+    def __init__(self, pos):
+        super().__init__(pos, radius=14, color=(30, 150, 255), speed=PLAYER_SPEED)
+        self.fire_cooldown = 0.15
+        self.time_since_fire = 0.0
+        self.kills = 0
+
+    def update(self, dt, keys, mouse_pos):
+        # Movement
+        dirv = pygame.math.Vector2(0, 0)
+        if keys[pygame.K_w] or keys[pygame.K_UP]: dirv.y -= 1
+        if keys[pygame.K_s] or keys[pygame.K_DOWN]: dirv.y += 1
+        if keys[pygame.K_a] or keys[pygame.K_LEFT]: dirv.x -= 1
+        if keys[pygame.K_d] or keys[pygame.K_RIGHT]: dirv.x += 1
+        if dirv.length_squared() > 0:
+            dirv = dirv.normalize()
+        self.vel = dirv * self.speed
+        self.pos += self.vel * dt
+        # clamp to world
+        self.pos.x = clamp(self.pos.x, 0, WIDTH)
+        self.pos.y = clamp(self.pos.y, 0, HEIGHT)
+        self.time_since_fire += dt
+
+    def can_fire(self):
+        return self.time_since_fire >= self.fire_cooldown
+
+    def fire(self, target_pos):
+        self.time_since_fire = 0.0
+        dirv = (pygame.math.Vector2(target_pos) - self.pos)
+        if dirv.length_squared() == 0:
+            dirv = pygame.math.Vector2(1, 0)
+        dirv = dirv.normalize()
+        vel = dirv * BULLET_SPEED
+        bpos = self.pos + dirv * (self.radius + 6)
+        return Bullet(pos=bpos, vel=vel, owner_id=self.id)
+
+class Bot(Entity):
+    def __init__(self, pos):
+        super().__init__(pos, radius=13, color=(220, 80, 80), speed=BOT_SPEED)
+        self.wander_timer = 0.0
+        self.target = pygame.math.Vector2(random.uniform(0, WIDTH), random.uniform(0, HEIGHT))
+        self.aggro_radius = 180
+        self.fire_cooldown = random.uniform(0.5, 1.2)
+        self.time_since_fire = 0.0
+
+    def update(self, dt, player_pos, bullets_list):
+        # Simple AI: wander else chase & shoot if near
+        dist = distance(self.pos, player_pos)
+        self.time_since_fire += dt
+
+        if dist < self.aggro_radius:
+            # move towards player
+            dirv = (player_pos - self.pos)
+            if dirv.length_squared() > 0:
+                dirv = dirv.normalize()
+            self.vel = dirv * self.speed
+            # try to shoot
+            if self.time_since_fire >= self.fire_cooldown:
+                self.time_since_fire = 0.0
+                dir_shoot = (player_pos - self.pos)
+                if dir_shoot.length_squared() == 0:
+                    dir_shoot = pygame.math.Vector2(1,0)
+                dir_shoot = dir_shoot.normalize()
+                bullets_list.append(Bullet(pos=self.pos + dir_shoot*(self.radius+6),
+                                           vel=dir_shoot * (BULLET_SPEED*0.85),
+                                           owner_id=self.id))
+        else:
+            # wander
+            self.wander_timer -= dt
+            if self.wander_timer <= 0:
+                self.wander_timer = random.uniform(1.2, 3.0)
+                self.target = pygame.math.Vector2(random.uniform(0+SPAWN_MARGIN, WIDTH-SPAWN_MARGIN),
+                                                  random.uniform(0+SPAWN_MARGIN, HEIGHT-SPAWN_MARGIN))
+            dirv = (self.target - self.pos)
+            if dirv.length_squared() > 4:
+                dirv = dirv.normalize()
+                self.vel = dirv * self.speed * 0.7
+            else:
+                self.vel *= 0.5
+
+        self.pos += self.vel * dt
+        # clamp
+        self.pos.x = clamp(self.pos.x, 0, WIDTH)
+        self.pos.y = clamp(self.pos.y, 0, HEIGHT)
+
+class Zone:
+    def __init__(self, center=None, radius=ZONE_START_RADIUS):
+        self.center = pygame.math.Vector2(center if center else (WIDTH/2, HEIGHT/2))
+        self.radius = radius
+        self.next_shrink_time = ZONE_SHRINK_INTERVAL
+        self.elapsed = 0.0
+
+    def update(self, dt):
+        self.elapsed += dt
+        if self.elapsed >= self.next_shrink_time:
+            # shrink
+            self.radius *= (1.0 - ZONE_SHRINK_AMOUNT)
+            self.next_shrink_time += ZONE_SHRINK_INTERVAL
+            # optionally move center slightly
+            self.center += pygame.math.Vector2(random.uniform(-40, 40), random.uniform(-30, 30))
+            # clamp center to world
+            self.center.x = clamp(self.center.x, 0, WIDTH)
+            self.center.y = clamp(self.center.y, 0, HEIGHT)
+
+    def inside(self, point):
+        return distance(self.center, pygame.math.Vector2(point)) <= self.radius
+
+    def draw(self, surf):
+        s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        # draw the safe circle (transparent fill)
+        pygame.draw.circle(s, (60, 200, 60, 30), (int(self.center.x), int(self.center.y)), int(self.radius))
+        # outline
+        pygame.draw.circle(s, (60, 200, 60, 100), (int(self.center.x), int(self.center.y)), int(self.radius), 3)
+        surf.blit(s, (0, 0))
+
+# Game management
+def spawn_bots(n, exclude_pos=None):
+    bots = []
+    for _ in range(n):
+        while True:
+            x = random.uniform(SPAWN_MARGIN, WIDTH - SPAWN_MARGIN)
+            y = random.uniform(SPAWN_MARGIN, HEIGHT - SPAWN_MARGIN)
+            if not exclude_pos or distance(pygame.math.Vector2(x,y), pygame.math.Vector2(exclude_pos)) > 80:
+                bots.append(Bot((x,y)))
+                break
+    return bots
+
+def restart_game():
+    player = Player((WIDTH * 0.5, HEIGHT * 0.5))
+    bots = spawn_bots(BOT_COUNT, exclude_pos=player.pos)
+    bullets = []
+    zone = Zone(center=(WIDTH/2, HEIGHT/2), radius=ZONE_START_RADIUS)
+    game_time = 0.0
+    return player, bots, bullets, zone, game_time
+
+# Collision helpers
+def handle_bullet_entity_collisions(bullets, entities):
+    # bullets hits entity (not owner)
+    for b in bullets[:]:
+        for e in entities:
+            if e.alive and e.id != b.owner_id:
+                if distance(b.pos, e.pos) <= e.radius + 4:
+                    # damage and remove bullet
+                    e.take_damage(28)
+                    try:
+                        bullets.remove(b)
+                    except ValueError:
+                        pass
+                    break
+
+def remove_dead(bots, player):
+    killed = 0
+    new_bots = []
+    for b in bots:
+        if b.alive:
+            new_bots.append(b)
+        else:
+            killed += 1
+    # If bots die, increase player's kill count if player caused it (we approximate by checking health)
+    # For simplicity we don't track last hitter; increment nothing here.
+    return new_bots, killed
+
+# Main loop
+def main():
+    player, bots, bullets, zone, game_time = restart_game()
+    running = True
+    camera = pygame.math.Vector2(0,0)
+    last_mouse = pygame.mouse.get_pos()
+    while running:
+        dt = clock.tick(FPS) / 1000.0
+        game_time += dt
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+                break
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                    break
+                if event.key == pygame.K_r:
+                    player, bots, bullets, zone, game_time = restart_game()
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:  # left click shoot
+                    if player.can_fire():
+                        b = player.fire(pygame.mouse.get_pos())
+                        bullets.append(b)
+
+        keys = pygame.key.get_pressed()
+        mouse_pos = pygame.mouse.get_pos()
+        # update
+        player.update(dt, keys, mouse_pos)
+        for bot in bots:
+            bot.update(dt, player.pos, bullets)
+        for b in bullets[:]:
+            b.update(dt)
+            if not b.is_alive():
+                try:
+                    bullets.remove(b)
+                except ValueError:
+                    pass
+
+        # collisions
+        handle_bullet_entity_collisions(bullets, bots + [player])
+
+        # remove dead bots
+        prev_bot_count = len(bots)
+        bots, killed = remove_dead(bots, player)
+        if killed > 0:
+            player.kills += killed
+
+        # zone update and zone damage
+        zone.update(dt)
+        if not zone.inside(player.pos):
+            player.take_damage(ZONE_DAMAGE_PER_SEC * dt)
+        for bot in bots:
+            if not zone.inside(bot.pos):
+                bot.take_damage(ZONE_DAMAGE_PER_SEC * dt)
+
+        # check game over / winner
+        alive_bots = sum(1 for b in bots if b.alive)
+        alive_players = 1 if player.alive else 0
+        alive_total = alive_bots + alive_players
+
+        # camera simple center on player (clamped)
+        camera.x = clamp(player.pos.x - WIDTH/2, 0, WIDTH)
+        camera.y = clamp(player.pos.y - HEIGHT/2, 0, HEIGHT)
+
+        # draw
+        screen.fill((20, 20, 20))
+        zone.draw(screen)
+
+        # draw bullets
+        for b in bullets:
+            p = b.pos
+            pygame.draw.circle(screen, (255, 240, 100), (int(p.x), int(p.y)), 3)
+
+        # draw bots and player
+        for b in bots:
+            b.draw(screen, camera_offset=camera)
+        player.draw(screen, camera_offset=camera)
+
+        # HUD
+        hud_y = 8
+        def draw_text(txt, x, y, color=(255,255,255)):
+            surf = font.render(txt, True, color)
+            screen.blit(surf, (x, y))
+
+        draw_text(f"Health: {int(player.health)}", 12, hud_y)
+        draw_text(f"Kills: {player.kills}", 12, hud_y+22)
+        draw_text(f"Alive: {alive_total}", WIDTH - 140, hud_y)
+        draw_text(f"Zone radius: {int(zone.radius)}", WIDTH - 260, hud_y)
+        # show next shrink countdown
+        next_shrink = max(0.0, zone.next_shrink_time - zone.elapsed)
+        draw_text(f"Next shrink in: {next_shrink:.0f}s", WIDTH - 260, hud_y+22)
+
+        # if player dead or winner
+        if not player.alive:
+            draw_text("YOU DIED - Press R to restart", WIDTH/2 - 140, HEIGHT/2 - 20, (230,80,80))
+        elif alive_total <= 1:
+            draw_text("YOU WIN! Press R to play again", WIDTH/2 - 160, HEIGHT/2 - 20, (80,230,120))
+
+        pygame.display.flip()
+
+    pygame.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
+
